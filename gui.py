@@ -122,6 +122,8 @@ class RecruitApp:
         ttk.Label(details, textvariable=self.backend_var, wraplength=280, style='Hint.TLabel').pack(anchor='w', pady=5)
         self.geometry_var = tk.StringVar(value='画面：不限分辨率，自动适配')
         ttk.Label(details, textvariable=self.geometry_var, wraplength=280, style='Hint.TLabel').pack(anchor='w', pady=(0, 5))
+        self.luck_var = tk.StringVar(value='幸运值：等待检测')
+        ttk.Label(details, textvariable=self.luck_var, wraplength=280, style='Hint.TLabel').pack(anchor='w', pady=(0, 5))
         self.match_var = tk.StringVar(value='仅检测已勾选角色，尚未检测。')
         ttk.Label(details, textvariable=self.match_var, wraplength=280).pack(anchor='w', pady=5)
         self.decision_var = tk.StringVar(value='请先手动打开游戏的常驻招募界面。')
@@ -147,6 +149,8 @@ class RecruitApp:
         self.detect_button.pack(side='left', padx=5)
         self.start_button = ttk.Button(bottom, text='开始抽取', command=lambda: self.start(True))
         self.start_button.pack(side='left', padx=5)
+        self.pity_button = ttk.Button(bottom, text='抽取到保底出红', command=lambda: self.start(True, until_pity=True))
+        self.pity_button.pack(side='left', padx=5)
         self.stop_button = ttk.Button(bottom, text='停止', command=self.stop, state='disabled')
         self.stop_button.pack(side='left', padx=5)
         ttk.Label(root, text='画面自动适配，请保持招募界面完整可见。检测只截图；出现金色未抽中后的「放弃」时自动放弃，不使用钻石补抽。',
@@ -617,7 +621,8 @@ class RecruitApp:
             self.history_detail_tree.insert('', 'end', values=(name, count))
         won = sum(item['count'] for item in run['recruited'].values())
         reason = run['reason'] or '正在抽取，记录实时更新'
-        self.history_summary_var.set(f"本次抽取 {run['rounds']} 次，抽中勾选角色 {won} 次，累计 {run['coins']} 金币。{reason}")
+        mode = '保底出红' if run.get('mode') == 'pity' else '普通抽取'
+        self.history_summary_var.set(f"{mode}：本次抽取 {run['rounds']} 次，抽中勾选角色 {won} 次，累计 {run['coins']} 金币。{reason}")
 
     def selected(self):
         with self.selection_lock:
@@ -691,6 +696,11 @@ class RecruitApp:
         photo = ImageTk.PhotoImage(picture, master=self.root)
         self.preview.configure(image=photo, text='')
         self.preview.image = photo
+        if scene.luck is not None:
+            current, maximum = scene.luck
+            self.luck_var.set(f'幸运值：{current}/{maximum}' + ('（下一抽保底）' if current >= maximum - 1 else ''))
+        elif scene.kind == 'select':
+            self.luck_var.set('幸运值：未识别')
         selected = self.selected()
         if scene.kind == 'select' and (not selected or selected_ids == selected):
             target = choose_multiplier([h.id for h in heroes], selected)
@@ -704,7 +714,7 @@ class RecruitApp:
             self.match_var.set('当前不是金币招募选择界面。')
             self.decision_var.set('当前招募界面尚未确认，等待界面就绪。' if scene.kind != 'result' else '检测到待放弃界面；开始抽取后自动点击放弃并继续。')
 
-    def start(self, recruit):
+    def start(self, recruit, until_pity=False):
         if self.worker is not None or self.environment_worker is not None or self.closing:
             return
         try:
@@ -726,7 +736,7 @@ class RecruitApp:
         if recruit:
             targets = [dict(role) for role in self.roles if role['id'] in self.selected()]
             try:
-                run_id = self.run_history.begin(targets)
+                run_id = self.run_history.begin(targets, mode='pity' if until_pity else 'normal')
             except OSError as error:
                 self.record_error('创建抽取记录', str(error), error=error)
                 messagebox.showerror('保存抽取记录失败', str(error), parent=self.root)
@@ -735,7 +745,9 @@ class RecruitApp:
             self.refresh_history()
         self.stop_event.clear()
         self.set_busy(True)
-        self.status_var.set('抽取中' if recruit else '检测中')
+        self.status_var.set(('保底抽取中' if until_pity else '抽取中') if recruit else '检测中')
+        if until_pity:
+            self.append_log('保底模式：幸运值达到 24/25 后再抽一次，确认完成即停止；轮数和金币上限仍生效。')
 
         def submitted(total, coins):
             if run_id is not None:
@@ -773,7 +785,7 @@ class RecruitApp:
                                        log=lambda s: self.events.put(('log', s)), update=self.publish_frame,
                                        on_recruited=recruited, on_draw=submitted)
                 if recruit:
-                    runner.run(rounds, coins)
+                    runner.run(rounds, coins, until_pity=until_pity)
                 else:
                     _, scene, heroes, target = runner.inspect()
                     match_text = '匹配到：' + ' / '.join(h.name for h in heroes) if heroes else '未匹配到勾选角色'
@@ -793,19 +805,19 @@ class RecruitApp:
                         if self.stop_event.is_set():
                             outcome, reason = 'stopped', '关闭面板' if self.closing else '用户停止'
                         else:
-                            reason = '达到轮数上限' if rounds and total >= rounds else '达到本次金币上限'
+                            reason = runner.end_reason if runner is not None else reason
                     try:
                         self.run_history.finish(run_id, outcome, reason, total, spent)
                     except OSError as error:
                         self.record_error('保存抽取记录', str(error), error=error)
                         self.events.put(('log', f'保存抽取记录失败：{error}'))
-                self.events.put(('done', run_id))
+                self.events.put(('done', {'run_id': run_id, 'pity_completed': runner is not None and runner.pity_completed}))
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
 
     def set_busy(self, busy):
-        for button in (self.detect_button, self.start_button, self.import_button, self.clear_stats_button, self.environment_button):
+        for button in (self.detect_button, self.start_button, self.pity_button, self.import_button, self.clear_stats_button, self.environment_button):
             button.configure(state='disabled' if busy else 'normal')
         if self.settings_save_button is not None:
             self.settings_save_button.configure(state='disabled' if busy else 'normal')
@@ -872,11 +884,12 @@ class RecruitApp:
                             self.set_environment_detail(summary)
                 elif kind == 'done':
                     self.worker = None
-                    if self.active_run_id == value:
+                    if self.active_run_id == value['run_id']:
                         self.active_run_id = None
                     self.refresh_history()
                     self.set_busy(False)
-                    self.status_var.set('已停止' if self.stop_event.is_set() else '空闲')
+                    self.status_var.set('已停止' if self.stop_event.is_set() else
+                                        '已完成保底抽取' if value['pity_completed'] else '空闲')
         except queue.Empty:
             pass
 

@@ -48,12 +48,12 @@ class RecruitHistory:
         with self.lock:
             return deepcopy(self.runs)
 
-    def begin(self, targets):
+    def begin(self, targets, mode='normal'):
         with self.lock:
             run_id = uuid.uuid4().hex
             self.runs.append({'id': run_id, 'started_at': now(), 'ended_at': None,
                               'status': 'running', 'reason': '', 'rounds': 0, 'coins': 0,
-                              'targets': deepcopy(targets), 'recruited': {}})
+                              'targets': deepcopy(targets), 'recruited': {}, 'mode': mode})
             try:
                 self._save()
             except OSError:

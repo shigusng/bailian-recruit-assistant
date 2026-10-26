@@ -203,6 +203,7 @@ class Scene:
     owned_shards: tuple = (None, None, None)
     hero_regions: tuple = ()
     decrease: tuple | None = None
+    luck: tuple | None = None
 
 
 class SceneReader:
@@ -246,9 +247,11 @@ class SceneReader:
                     break
         return acquired
 
-    def _read_items(self, image, bounds):
+    def _read_items(self, image, bounds, scale=1.):
         left, top, right, bottom = bounds
         cropped = image[top:bottom, left:right] if image is not None else None
+        if cropped is not None and scale != 1.:
+            cropped = cv2.resize(cropped, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         try:
             rows, _ = self.ocr(cropped)
         except Exception as error:
@@ -262,10 +265,37 @@ class SceneReader:
         items = []
         for box, text, confidence in rows or []:
             if confidence >= .8:
-                items.append((re.sub(r'\s', '', text), (left + int(np.mean([p[0] for p in box])), top + int(np.mean([p[1] for p in box])))))
+                items.append((re.sub(r'\s', '', text),
+                              (left + round(float(np.mean([p[0] for p in box])) / scale),
+                               top + round(float(np.mean([p[1] for p in box])) / scale))))
         return items
 
-    def read(self, image):
+    @staticmethod
+    def read_luck(items, shape, controls_y=None):
+        height, width = shape[:2]
+        labels = [point for text, point in items if ('幸运值' in text or '幸運值' in text) and point[1] > height * .45]
+        candidates = []
+        for text, point in items:
+            normalized = text.replace('／', '/').replace('\\', '/')
+            match = re.search(r'(?<!\d)(\d{1,3})/(\d{1,3})(?!\d)', normalized)
+            if not match or not width * .15 < point[0] < width * .85:
+                continue
+            current, maximum = map(int, match.groups())
+            if maximum != 25 or not 0 <= current <= maximum:
+                continue
+            if controls_y is not None and point[1] <= controls_y + min(width * .12, height * .06):
+                continue
+            labelled = '幸运值' in text or '幸運值' in text or any(
+                abs(point[1] - label[1]) < max(12, min(width, height) * .045) for label in labels)
+            if labelled and point[1] > height * .45:
+                candidates.append((0, -point[1], (current, maximum)))
+            elif point[1] > height * .72:
+                # Without the label, accept only the game's /25 footer,
+                # never a character fragment fraction above the controls.
+                candidates.append((1, -point[1], (current, maximum)))
+        return min(candidates)[2] if candidates else None
+
+    def read(self, image, require_luck=False):
         # Preserve the capture's aspect ratio. All OCR coordinates and card
         # regions belong to this frame, rather than a fixed 2400-pixel height.
         shape = image.shape[:2] if image is not None else (2400, 1080)
@@ -285,7 +315,8 @@ class SceneReader:
             # the usual band. Only the initial layout needs this wider pass.
             items = self._read_items(image, (0, 0, width, height))
         texts = tuple(text for text, _ in items)
-        base_details = {'texts': texts, 'hero_regions': self._hero_regions}
+        base_details = {'texts': texts, 'hero_regions': self._hero_regions,
+                        'luck': self.read_luck(items, shape)}
         if any('金币不足' in text or '金幣不足' in text for text in texts):
             return Scene('insufficient', **base_details)
         if any('获得英雄碎片' in text or '獲得英雄碎片' in text for text in texts):
@@ -346,7 +377,14 @@ class SceneReader:
                     shard_points[slot] = point
             self._hero_regions = recruitment_regions(shape, title[1], controls_y, shard_points)
             self._title_y, self._controls_y = title[1], controls_y
-        details = {'texts': texts, 'owned_shards': tuple(shards), 'hero_regions': self._hero_regions}
+        luck = self.read_luck(items, shape, controls_y)
+        if require_luck and image is not None and controls_y is not None:
+            # A separate enlarged footer pass is authoritative for the pity
+            # mode, where confusing 2/25 with 25/25 would stop too early.
+            top = min(height - 1, max(0, round(controls_y + min(width * .08, height * .04))))
+            footer_items = self._read_items(image, (0, top, width, height), scale=1.5)
+            luck = self.read_luck(footer_items, shape, controls_y)
+        details = {'texts': texts, 'owned_shards': tuple(shards), 'hero_regions': self._hero_regions, 'luck': luck}
         if abandon is not None:
             return Scene('result', abandon=abandon, **details)
         if pair is None:
@@ -433,6 +471,12 @@ class RecruitRunner:
         self.on_recruited = on_recruited
         self.on_draw = on_draw
         self.recruited = 0
+        self.until_pity = False
+        self.pity_completed = False
+        self.end_reason = ''
+
+    def read_scene(self, image):
+        return self.reader.read(image, require_luck=True) if self.until_pity else self.reader.read(image)
 
     def recognize_targets(self, image, scene, selected_ids):
         if scene.hero_regions:
@@ -441,7 +485,7 @@ class RecruitRunner:
 
     def inspect(self):
         image = self.device.screenshot()
-        scene = self.reader.read(image)
+        scene = self.read_scene(image)
         self.detected_selection = frozenset(self.selected())
         heroes = self.recognize_targets(image, scene, self.detected_selection) if scene.kind == 'select' and self.detected_selection else []
         multiplier = choose_multiplier([h.id for h in heroes], self.detected_selection)
@@ -462,8 +506,23 @@ class RecruitRunner:
                 raise RuntimeError('未确认倍率按钮，已停止；请保持招募界面完整可见')
             self.device.tap(point)
             self.device.wait(.55)
-            scene = self.reader.read(self.device.screenshot())
+            scene = self.read_scene(self.device.screenshot())
         raise RuntimeError('倍率未切换成功，已停止')
+
+    def confirm_luck(self, previous, inspection):
+        # Both readings come from fresh screenshots; never spend on a cached
+        # or single OCR result. Changes of targets are rechecked by run().
+        for attempt in range(6):
+            image, scene, heroes, target = inspection
+            self.require_select(scene)
+            if scene.luck is not None and scene.luck == previous:
+                return inspection
+            previous = scene.luck
+            if attempt < 5:
+                self.device.wait(SCAN_INTERVAL)
+                inspection = self.inspect()
+        self.save_diagnostic(image, scene, heroes)
+        raise RuntimeError('幸运值未能连续两次确认，已停止；未提交新的抽取，请保持底部幸运值清晰可见')
 
     def abandon_result(self, scene, target):
         if scene.kind != 'result' or scene.abandon is None:
@@ -475,7 +534,7 @@ class RecruitRunner:
         while time.monotonic() < deadline:
             self.device.wait(SCAN_INTERVAL)
             frame = self.device.screenshot()
-            state = self.reader.read(frame)
+            state = self.read_scene(frame)
             self.update(frame, state, [], target)
             if state.kind == 'insufficient':
                 raise RuntimeError('金币不足，停止')
@@ -490,8 +549,13 @@ class RecruitRunner:
     def round_marker(scene):
         # Fragment quantities / luck progress indicate a completed draw.
         # The refresh countdown is deliberately excluded.
-        return tuple(sorted(text.lower().replace('×', 'x') for text in scene.texts
-                            if re.fullmatch(r'[xX×]\d+|\d+/25', text)))
+        markers = [text.lower().replace('×', 'x') for text in scene.texts
+                   if re.fullmatch(r'[xX×]\d+', text)]
+        if scene.luck is not None:
+            markers.append(f'{scene.luck[0]}/{scene.luck[1]}')
+        else:
+            markers.extend(text for text in scene.texts if re.fullmatch(r'\d+/25', text))
+        return tuple(sorted(markers))
 
     def finish_round(self, before_scene, target, before_image=None, targets=(), selected_ids=()):
         deadline = time.monotonic() + 12
@@ -544,7 +608,7 @@ class RecruitRunner:
         while time.monotonic() < deadline:
             self.device.wait(SCAN_INTERVAL)
             frame = self.device.screenshot()
-            state = self.reader.read(frame)
+            state = self.read_scene(frame)
             self.update(frame, state, [], target)
             if state.kind == 'insufficient':
                 raise RuntimeError('金币不足，停止')
@@ -560,6 +624,11 @@ class RecruitRunner:
             # Confirm progress without identifying any of the three characters.
             marker = self.round_marker(state)
             progressed = bool(before_marker and marker and marker != before_marker)
+            if self.until_pity:
+                # Missing OCR text is not progress. Without an animation,
+                # require a changed, readable luck counter in this mode.
+                progressed = bool(before_scene.luck is not None and state.luck is not None and
+                                  state.luck != before_scene.luck)
             if saw_transition or progressed:
                 signature = (state.multiplier, state.price, marker)
                 if signature == stable_scene:
@@ -570,7 +639,10 @@ class RecruitRunner:
         self.save_diagnostic(frame, state, [])
         raise RuntimeError('招募后未确认结果或下一轮界面，已停止；未补点任何按钮')
 
-    def run(self, max_rounds, coin_limit):
+    def run(self, max_rounds, coin_limit, until_pity=False):
+        self.until_pity = until_pity
+        self.pity_completed = False
+        self.end_reason = ''
         try:
             while not max_rounds or self.rounds < max_rounds:
                 image, scene, heroes, target = self.inspect()
@@ -578,10 +650,14 @@ class RecruitRunner:
                     self.abandon_result(scene, target)
                     continue
                 self.require_select(scene)
+                previous_luck = scene.luck
                 scene = self.set_multiplier(scene, target)
                 # Recheck actors after animations/bet changes and read current
                 # checkbox values immediately before a spending click.
-                image, scene, heroes, latest_target = self.inspect()
+                inspection = self.inspect()
+                if until_pity:
+                    inspection = self.confirm_luck(previous_luck, inspection)
+                image, scene, heroes, latest_target = inspection
                 self.require_select(scene)
                 if latest_target != target or frozenset(self.selected()) != self.detected_selection:
                     self.log('目标匹配结果或勾选项发生变化，重新检测')
@@ -589,8 +665,13 @@ class RecruitRunner:
                 if scene.multiplier != target or scene.price != target * 100:
                     raise RuntimeError('实际倍率/金额与策略不符，已停止')
                 if coin_limit and self.coins + scene.price > coin_limit:
-                    self.log('已达到本次金币上限，停止')
+                    self.end_reason = '达到本次金币上限'
+                    self.log(self.end_reason + '，停止')
                     break
+                pity_draw = until_pity and scene.luck[0] >= scene.luck[1] - 1
+                if until_pity:
+                    current, maximum = scene.luck
+                    self.log(f'幸运值 {current}/{maximum}' + ('：本次为保底抽取，完成后停止' if pity_draw else '，继续抽取'))
                 match_text = '匹配到勾选角色：' + ' / '.join(h.name for h in heroes) if heroes else '未匹配到勾选角色'
                 self.log(f'第 {self.rounds + 1} 轮：{match_text} → {target} 倍，{scene.price} 金币')
                 price = scene.price
@@ -602,6 +683,14 @@ class RecruitRunner:
                 self.on_draw(self.rounds, self.coins)
                 self.finish_round(scene, target, before_image=image, targets=heroes,
                                   selected_ids=self.detected_selection)
+                if pity_draw:
+                    self.pity_completed = True
+                    self.end_reason = f'已完成保底出红抽取（抽取前幸运值 {current}/{maximum}）'
+                    self.log(self.end_reason + '，停止')
+                    break
+            if not self.end_reason and max_rounds and self.rounds >= max_rounds:
+                self.end_reason = '达到轮数上限'
+                self.log(self.end_reason + '，停止')
         except Stopped:
             self.log('已停止')
         finally:
