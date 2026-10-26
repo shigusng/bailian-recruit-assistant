@@ -42,7 +42,7 @@ class FakeReader:
         if self.device.result:
             return Scene('result', abandon=(500, 2000))
         return Scene('select', self.device.multiplier, self.device.multiplier * 100,
-                     (500, 1850), (900, 1720))
+                     (500, 1850), (900, 1720), decrease=(343, 1727))
 
 
 class FakeRecognizer:

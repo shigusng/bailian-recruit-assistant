@@ -131,26 +131,30 @@ def check_environment(base, settings_directory, adb, serial, roles, report, stop
         cancelled()
         if connected:
             try:
-                size = run_adb('-s', serial, 'shell', 'wm', 'size')
-                values = re.findall(r'(\d+)x(\d+)', size)
-                if not values:
-                    raise RuntimeError('未能读取设备分辨率：' + size)
-                width, height = map(int, values[-1])
-                correct_ratio = height > 0 and abs(width / height - 1080 / 2400) <= .015
-                emit('设备画面比例', 'ok' if correct_ratio else 'error',
-                     f'{width}×{height}；' + ('比例符合要求。' if correct_ratio else '请设置为竖屏 1080×2400 或相同比例。'))
-                if correct_ratio:
-                    from gacha_core import AdbDevice
-                    image = AdbDevice(adb=adb_path, serial=serial, stop=stop).screenshot()
-                    emit('设备截图', 'ok', '截图读取成功；未点击游戏。')
-                    cancelled()
-                    if reader is not None:
-                        emit('截图 OCR 识别', 'running', '正在验证当前截图的 OCR 识别……')
-                        scene = reader.read(image)
-                        emit('截图 OCR 识别', 'ok', '识别流程正常；' +
-                             ('当前为金币招募界面。' if scene.kind == 'select' else '请在抽取前手动打开常驻招募界面。'))
-                        emit('OCR 模型与后端', 'warn' if reader.backend_note else 'ok',
-                             reader.backend + (f'\n{reader.backend_note}' if reader.backend_note else ''))
+                try:
+                    size = run_adb('-s', serial, 'shell', 'wm', 'size')
+                    values = re.findall(r'(\d+)x(\d+)', size)
+                    if not values or min(map(int, values[-1])) <= 0:
+                        raise RuntimeError('未能读取有效设备尺寸：' + size)
+                    width, height = map(int, values[-1])
+                    emit('设备分辨率', 'ok', f'{width}×{height}；不限分辨率模式，以实际截图自动适配。')
+                except CheckCancelled:
+                    raise
+                except Exception as error:
+                    emit('设备分辨率', 'warn', f'{error}。将以实际截图尺寸继续检测。')
+                from gacha_core import AdbDevice
+                device = AdbDevice(adb=adb_path, serial=serial, stop=stop)
+                image = device.screenshot()
+                emit('画面自动适配', 'ok', device.geometry.describe() + '；识别位置与点击坐标自动换算。')
+                emit('设备截图', 'ok', '截图读取成功；未点击游戏。')
+                cancelled()
+                if reader is not None:
+                    emit('截图 OCR 识别', 'running', '正在验证当前截图的 OCR 识别……')
+                    scene = reader.read(image)
+                    emit('截图 OCR 识别', 'ok', '识别流程正常；' +
+                         ('当前为金币招募界面。' if scene.kind == 'select' else '请在抽取前手动打开常驻招募界面，并保持画面完整可见。'))
+                    emit('OCR 模型与后端', 'warn' if reader.backend_note else 'ok',
+                         reader.backend + (f'\n{reader.backend_note}' if reader.backend_note else ''))
             except CheckCancelled:
                 raise
             except Exception as error:

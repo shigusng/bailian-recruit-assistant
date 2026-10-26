@@ -120,6 +120,8 @@ class RecruitApp:
         ttk.Button(statistics, text='抽取记录', command=self.show_history).pack(side='right', padx=(0, 5))
         self.backend_var = tk.StringVar(value='OCR：自动选择独显 / CPU')
         ttk.Label(details, textvariable=self.backend_var, wraplength=280, style='Hint.TLabel').pack(anchor='w', pady=5)
+        self.geometry_var = tk.StringVar(value='画面：不限分辨率，自动适配')
+        ttk.Label(details, textvariable=self.geometry_var, wraplength=280, style='Hint.TLabel').pack(anchor='w', pady=(0, 5))
         self.match_var = tk.StringVar(value='仅检测已勾选角色，尚未检测。')
         ttk.Label(details, textvariable=self.match_var, wraplength=280).pack(anchor='w', pady=5)
         self.decision_var = tk.StringVar(value='请先手动打开游戏的常驻招募界面。')
@@ -147,7 +149,7 @@ class RecruitApp:
         self.start_button.pack(side='left', padx=5)
         self.stop_button = ttk.Button(bottom, text='停止', command=self.stop, state='disabled')
         self.stop_button.pack(side='left', padx=5)
-        ttk.Label(root, text='检测只截图，不点击。出现金色未抽中后的「放弃」时自动放弃并继续，不使用钻石补抽。',
+        ttk.Label(root, text='画面自动适配，请保持招募界面完整可见。检测只截图；出现金色未抽中后的「放弃」时自动放弃，不使用钻石补抽。',
                   style='Hint.TLabel').pack(anchor='w', padx=14, pady=(0, 10))
         root.protocol('WM_DELETE_WINDOW', self.close)
         self.poll_id = root.after(100, self.poll)
@@ -394,7 +396,7 @@ class RecruitApp:
         window.transient(self.root)
         window.backdrop = WindowBackdrop(window, self.background_image)
         ttk.Label(window, text='环境检测', style='Title.TLabel').pack(anchor='w', padx=16, pady=(14, 6))
-        ttk.Label(window, text='自动检查依赖、独显或 CPU、模型、保存目录、ADB 连接、画面比例以及截图识别；不会点击游戏。',
+        ttk.Label(window, text='自动检查依赖、独显或 CPU、模型、保存目录、ADB 连接、实际截图尺寸与画面适配；不会点击游戏。',
                   style='Hint.TLabel', wraplength=860).pack(anchor='w', padx=16, pady=(0, 12))
         content = BackdropFrame(window, padding=10, shade=.5)
         content.pack(fill='both', expand=True, padx=12)
@@ -754,7 +756,8 @@ class RecruitApp:
                     if self.reader.backend_note:
                         self.record_error('OCR / CPU 回退', self.reader.backend_note, level='WARNING')
                         self.events.put(('log', 'GPU 未启用，已使用 CPU：' + self.reader.backend_note))
-                device = AdbDevice(adb=adb, serial=serial, stop=self.stop_event)
+                device = AdbDevice(adb=adb, serial=serial, stop=self.stop_event,
+                                   on_geometry=lambda geometry: self.events.put(('geometry', geometry.describe())))
                 runner = RecruitRunner(device, self.recognizer, self.reader, self.selected,
                                        log=lambda s: self.events.put(('log', s)), update=self.publish_frame,
                                        on_recruited=recruited, on_draw=submitted)
@@ -829,6 +832,8 @@ class RecruitApp:
                     self.record_recruited(*value)
                 elif kind == 'backend':
                     self.backend_var.set('OCR：' + value)
+                elif kind == 'geometry':
+                    self.geometry_var.set('画面：' + value)
                 elif kind == 'history':
                     self.refresh_history()
                 elif kind == 'environment_row':

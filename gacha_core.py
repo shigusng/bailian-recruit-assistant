@@ -21,10 +21,12 @@ if not getattr(sys, 'frozen', False):
         sys.path.insert(0, str(BASE / '.gpu-deps'))
 import cv2
 import numpy as np
+from screen_geometry import (CaptureGeometry, REFERENCE_REGIONS, find_decrease,
+                             recruitment_regions, reference_regions, shard_bar_centers)
 
 ASSETS = RESOURCE_BASE / 'assets'
 DEFAULT_ADB = 'adb'
-REGIONS = [(35, 975, 330, 1320), (350, 1060, 710, 1410), (740, 975, 1070, 1320)]
+REGIONS = list(REFERENCE_REGIONS)
 SCAN_INTERVAL = .1
 
 
@@ -128,6 +130,8 @@ class HeroRecognizer:
         return templates
 
     def recognize_region(self, region, templates):
+        if region.size == 0 or min(region.shape[:2]) < 8:
+            return HeroMatch(None, '未匹配到勾选角色')
         keys, desc = self.sift.detectAndCompute(cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), None)
         if desc is None or len(keys) < 8:
             return HeroMatch(None, '未匹配到勾选角色')
@@ -145,7 +149,7 @@ class HeroRecognizer:
                 continue
             scale = float(np.hypot(affine[0, 0], affine[1, 0]))
             angle = abs(float(np.degrees(np.arctan2(affine[1, 0], affine[0, 0]))))
-            if not .9 <= scale <= 3.4 or angle > 18:
+            if not .35 <= scale <= 6. or angle > 18:
                 continue
             # Geometry plus RGB agreement avoids a few generic eyes/edges
             # making a different hero count as a selected character.
@@ -170,14 +174,14 @@ class HeroRecognizer:
             return HeroMatch(None, '识别有歧义', best[0], best[1])
         return HeroMatch(best[2], self.names.get(best[2], self.names.get(best[2][:5], best[2])), best[0], best[1])
 
-    def recognize(self, image, selected_ids):
+    def recognize(self, image, selected_ids, regions=None):
         # Only selected characters (and their skins) participate in matching.
         # Keep only selected matches and their positions for result statistics.
         templates = self.templates_for(selected_ids)
         if not templates:
             return []
         matches = []
-        for slot, (x, y, x2, y2) in enumerate(REGIONS):
+        for slot, (x, y, x2, y2) in enumerate(regions or reference_regions(image.shape)):
             match = self.recognize_region(image[y:y2, x:x2], templates)
             if match.id:
                 match.slot = slot
@@ -195,6 +199,8 @@ class Scene:
     abandon: tuple | None = None
     texts: tuple = ()
     owned_shards: tuple = (None, None, None)
+    hero_regions: tuple = ()
+    decrease: tuple | None = None
 
 
 class SceneReader:
@@ -208,19 +214,28 @@ class SceneReader:
         x, y, width, height = bounds
         mask = mask[y:y+height, x:x+width]
         self.tick_templates = [cv2.resize(mask, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
-                               for scale in (.85, .925, 1., 1.075, 1.15)]
+                               for scale in (.35, .5, .65, .8, .925, 1., 1.15, 1.35, 1.6)]
+        self._layout_shape = None
 
     @staticmethod
     def green_mask(image):
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         return cv2.inRange(hsv, (35, 120, 140), (85, 255, 255))
 
-    def recruited_slots(self, image, slots):
+    def recruited_slots(self, image, slots, regions=None):
         acquired = set()
+        regions = regions or reference_regions(image.shape)
         for slot in slots:
-            x, y, x2, y2 = REGIONS[slot]
-            mask = self.green_mask(image[max(y, y2-210):y2, x:x2])
+            x, y, x2, y2 = regions[slot]
+            cropped = image[round(y + (y2-y) * .3):y2, x:x2]
+            if cropped.size == 0:
+                continue
+            mask = self.green_mask(cropped)
+            if not np.any(mask):
+                continue
             for template in self.tick_templates:
+                if not max(6, (x2-x) * .12) <= template.shape[1] <= (x2-x) * .65:
+                    continue
                 if template.shape[0] > mask.shape[0] or template.shape[1] > mask.shape[1]:
                     continue
                 score = cv2.matchTemplate(mask, template, cv2.TM_CCOEFF_NORMED)
@@ -229,11 +244,9 @@ class SceneReader:
                     break
         return acquired
 
-    def read(self, image):
-        # Exclude top account counters and the bottom navigation; keep all
-        # recruitment controls, fragment counters and possible dialogs.
-        left, top = 20, 440
-        cropped = image[top:2160, left:1060]
+    def _read_items(self, image, bounds):
+        left, top, right, bottom = bounds
+        cropped = image[top:bottom, left:right] if image is not None else None
         try:
             rows, _ = self.ocr(cropped)
         except Exception as error:
@@ -248,38 +261,103 @@ class SceneReader:
         for box, text, confidence in rows or []:
             if confidence >= .8:
                 items.append((re.sub(r'\s', '', text), (left + int(np.mean([p[0] for p in box])), top + int(np.mean([p[1] for p in box])))))
+        return items
+
+    def read(self, image):
+        # Preserve the capture's aspect ratio. All OCR coordinates and card
+        # regions belong to this frame, rather than a fixed 2400-pixel height.
+        shape = image.shape[:2] if image is not None else (2400, 1080)
+        height, width = shape
+        if getattr(self, '_layout_shape', None) != shape:
+            self._layout_shape = shape
+            self._hero_regions = reference_regions(shape)
+            self._title_y = self._controls_y = None
+        bounds = (round(width * .015), round(height * .08),
+                  max(1, round(width * .985)), max(1, round(height * .96)))
+        if image is None:
+            bounds = (0, 0, width, height)
+        items = self._read_items(image, bounds)
+        title_names = ('常驻招募', '常駐招募')
+        if image is not None and self._title_y is None and not any(text in title_names for text, _ in items):
+            # A first frame with unusual padding may place the heading beyond
+            # the usual band. Only the initial layout needs this wider pass.
+            items = self._read_items(image, (0, 0, width, height))
         texts = tuple(text for text, _ in items)
-        shards = [None, None, None]
-        for text, (x, y) in items:
-            match = re.fullmatch(r'(\d+)/(\d+)', text)
-            if match and 1240 < y < 1470:
-                slot = 0 if x < 350 else 2 if x > 730 else 1
-                shards[slot] = (int(match[1]), int(match[2]))
-        details = {'texts': texts, 'owned_shards': tuple(shards)}
+        base_details = {'texts': texts, 'hero_regions': self._hero_regions}
         if any('金币不足' in text or '金幣不足' in text for text in texts):
-            return Scene('insufficient', **details)
+            return Scene('insufficient', **base_details)
         if any('获得英雄碎片' in text or '獲得英雄碎片' in text for text in texts):
-            return Scene('reward', **details)
-        title = any(text in ('常驻招募', '常駐招募') and 400 < pt[1] < 700 for text, pt in items)
-        if not title:
-            return Scene('unknown', **details)
-        # The missed-gold screen also contains a green diamond purchase
-        # button. Only the separate label below it is the abandon action.
-        abandon = next((pt for text, pt in items
-                        if text in ('放弃', '放棄') and 300 < pt[0] < 750 and 1900 < pt[1] < 2100), None)
-        if abandon:
+            return Scene('reward', **base_details)
+        title = next((point for text, point in items if text in title_names and
+                      width * .15 < point[0] < width * .85 and 0 < point[1] < height * .75), None)
+        if title is None:
+            return Scene('unknown', **base_details)
+
+        # A real abandon label remains below the card area. Its location is
+        # read from OCR, never confused with the diamond purchase above it.
+        abandon = next((point for text, point in items if text in ('放弃', '放棄') and
+                        width * .25 < point[0] < width * .75 and
+                        point[1] > max(height * .45, title[1] + min(width, height) * .6)), None)
+        pairs = []
+        for text, point in items:
+            if not re.fullmatch(r'[123]倍[奖獎][励勵]', text):
+                continue
+            if not (width * .18 < point[0] < width * .78 and
+                    point[1] > title[1] + min(width, height) * .2):
+                continue
+            for label, maximum in items:
+                if (label == '最大' and maximum[0] > point[0] + width * .04 and
+                        abs(maximum[1] - point[1]) < min(width * .1, height * .075)):
+                    pairs.append((abs(maximum[1] - point[1]), int(text[0]), point, maximum))
+        pair = min(pairs, key=lambda item: item[0]) if pairs else None
+        controls_y = (pair[2][1] + pair[3][1]) / 2 if pair else None
+        if controls_y is None and abandon is not None:
+            controls_y = abandon[1] - min(width * .24, height * .13)
+
+        shards = [None, None, None]
+        shard_points = {}
+        if controls_y is not None and controls_y > title[1]:
+            span = controls_y - title[1]
+            bars = shard_bar_centers(image, title[1], controls_y)
+            fragments = []
+            for text, point in items:
+                match = re.fullmatch(r'(\d+)/(\d+)', text)
+                if match and title[1] + span * .15 < point[1] < title[1] + span * .85:
+                    fragments.append((point, (int(match[1]), int(match[2]))))
+            if not bars and len(fragments) == 3:
+                ordered = sorted(fragments, key=lambda value: value[0][0])
+                if ordered[1][0][0] - ordered[0][0][0] > 5 and ordered[2][0][0] - ordered[1][0][0] > 5:
+                    bars = tuple(point for point, _ in ordered)
+            shard_points.update(enumerate(bars))
+            distances = {}
+            for point, counts in fragments:
+                if bars:
+                    slot = min(range(3), key=lambda index: abs(point[0] - bars[index][0]))
+                    distance = abs(point[0] - bars[slot][0]) + abs(point[1] - bars[slot][1])
+                else:
+                    slot = max(0, min(2, int(point[0] * 3 / width)))
+                    expected_y = title[1] + span * .65 + (min(width / 12, span * .09) if slot == 1 else 0)
+                    distance = abs(point[1] - expected_y)
+                if slot not in distances or distance < distances[slot]:
+                    distances[slot] = distance
+                    shards[slot] = counts
+                    shard_points[slot] = point
+            self._hero_regions = recruitment_regions(shape, title[1], controls_y, shard_points)
+            self._title_y, self._controls_y = title[1], controls_y
+        details = {'texts': texts, 'owned_shards': tuple(shards), 'hero_regions': self._hero_regions}
+        if abandon is not None:
             return Scene('result', abandon=abandon, **details)
-        bet = next((int(m.group(1)) for text, pt in items
-                    if 1650 < pt[1] < 1800 and (m := re.fullmatch(r'([123])倍奖[励勵]|([123])倍獎勵', text))
-                    and m.group(1)), None)
-        # Both simplified/traditional text without relying on a broad pixel heuristic.
-        if bet is None:
-            bet = next((int(text[0]) for text, pt in items if re.fullmatch(r'[123]倍[奖獎][励勵]', text) and 1650 < pt[1] < 1800), None)
-        prices = [(int(text), pt) for text, pt in items if text in ('100', '200', '300') and 1760 < pt[1] < 1950 and 300 < pt[0] < 750]
-        maximum = next((pt for text, pt in items if text == '最大' and 1650 < pt[1] < 1800), None)
-        recruit_tip = any('招募其中一名英雄' in text for text in texts)
-        if bet and len(prices) == 1 and prices[0][0] == bet * 100 and maximum and recruit_tip:
-            return Scene('select', bet, prices[0][0], prices[0][1], maximum, **details)
+        if pair is None:
+            return Scene('unknown', **details)
+        _, bet, multiplier, maximum = pair
+        prices = [(int(text), point) for text, point in items if text in ('100', '200', '300') and
+                  width * .25 < point[0] < width * .75 and
+                  controls_y + max(8, min(width, height) * .015) < point[1] <
+                  controls_y + min(width * .38, height * .25)]
+        recruit_tip = any('招募其中一名英雄' in text and point[1] > controls_y for text, point in items)
+        if len(prices) == 1 and prices[0][0] == bet * 100 and recruit_tip:
+            decrease = find_decrease(image, multiplier, maximum, items)
+            return Scene('select', bet, prices[0][0], prices[0][1], maximum, decrease=decrease, **details)
         return Scene('unknown', **details)
 
 
@@ -288,10 +366,12 @@ class Stopped(Exception):
 
 
 class AdbDevice:
-    def __init__(self, adb=DEFAULT_ADB, serial='emulator-5554', stop=None):
+    def __init__(self, adb=DEFAULT_ADB, serial='emulator-5554', stop=None, on_geometry=None):
         self.adb, self.serial = resolve_adb(adb) or str(adb), serial
         self.stop = stop or threading.Event()
         self.actual_size = None
+        self.geometry = None
+        self.on_geometry = on_geometry
 
     def command(self, *args, timeout=20):
         if self.stop.is_set():
@@ -307,17 +387,19 @@ class AdbDevice:
         image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise RuntimeError('设备截图失败')
-        h, w = image.shape[:2]
-        if abs(w / h - 1080 / 2400) > .015:
-            raise RuntimeError('当前画面比例与校准不符；请使用竖屏 1080×2400 或同比例分辨率')
-        self.actual_size = (w, h)
-        return cv2.resize(image, (1080, 2400))
+        geometry = CaptureGeometry.from_image(image)
+        changed = geometry != self.geometry
+        self.geometry = geometry
+        self.actual_size = geometry.original_size
+        if changed and self.on_geometry is not None:
+            self.on_geometry(geometry)
+        return geometry.normalize(image)
 
     def tap(self, point):
-        if self.actual_size is None:
+        if self.geometry is None:
             raise RuntimeError('请先获取设备截图')
-        w, h = self.actual_size
-        self.command('shell', 'input', 'tap', str(round(point[0] * w / 1080)), str(round(point[1] * h / 2400)))
+        x, y = self.geometry.to_device_point(point)
+        self.command('shell', 'input', 'tap', str(x), str(y))
 
     def wait(self, seconds):
         if self.stop.wait(seconds):
@@ -335,11 +417,16 @@ class RecruitRunner:
         self.on_draw = on_draw
         self.recruited = 0
 
+    def recognize_targets(self, image, scene, selected_ids):
+        if scene.hero_regions:
+            return self.recognizer.recognize(image, selected_ids, regions=scene.hero_regions)
+        return self.recognizer.recognize(image, selected_ids)
+
     def inspect(self):
         image = self.device.screenshot()
         scene = self.reader.read(image)
         self.detected_selection = frozenset(self.selected())
-        heroes = self.recognizer.recognize(image, self.detected_selection) if scene.kind == 'select' and self.detected_selection else []
+        heroes = self.recognize_targets(image, scene, self.detected_selection) if scene.kind == 'select' and self.detected_selection else []
         multiplier = choose_multiplier([h.id for h in heroes], self.detected_selection)
         self.update(image, scene, heroes, multiplier, self.detected_selection)
         return image, scene, heroes, multiplier
@@ -353,7 +440,10 @@ class RecruitRunner:
             self.require_select(scene)
             if scene.multiplier == target and scene.price == target * 100:
                 return scene
-            self.device.tap(scene.maximum if target == 3 else (343, 1727))
+            point = scene.maximum if target == 3 else scene.decrease
+            if point is None:
+                raise RuntimeError('未确认倍率按钮，已停止；请保持招募界面完整可见')
+            self.device.tap(point)
             self.device.wait(.55)
             scene = self.reader.read(self.device.screenshot())
         raise RuntimeError('倍率未切换成功，已停止')
@@ -393,14 +483,21 @@ class RecruitRunner:
         stable_scene = None
         targets = [hero for hero in targets if hero.slot is not None]
         slots = {hero.slot for hero in targets}
-        old_ticks = self.reader.recruited_slots(before_image, slots) if slots and before_image is not None else set()
+
+        def ticks(frame, state):
+            regions = state.hero_regions or before_scene.hero_regions
+            if regions:
+                return self.reader.recruited_slots(frame, slots, regions=regions)
+            return self.reader.recruited_slots(frame, slots)
+
+        old_ticks = ticks(before_image, before_scene) if slots and before_image is not None else set()
         counted = False
 
         def record_result(frame, state):
             nonlocal counted
             if counted or not targets:
                 return
-            acquired = self.reader.recruited_slots(frame, slots) - old_ticks
+            acquired = ticks(frame, state) - old_ticks
             # Fragment progress provides another confirmation when a brief
             # checkmark was missed. On a new selection screen, also confirm
             # that the selected character still occupies that position.
@@ -411,7 +508,7 @@ class RecruitRunner:
                 if before and after and before[1] == after[1] and after[0] > before[0]:
                     increased.add(hero.slot)
             if increased and state.kind == 'select':
-                same_targets = {(hero.slot, hero.id) for hero in self.recognizer.recognize(frame, selected_ids)}
+                same_targets = {(hero.slot, hero.id) for hero in self.recognize_targets(frame, state, selected_ids)}
                 increased = {hero.slot for hero in targets if hero.slot in increased and (hero.slot, hero.id) in same_targets}
             elif state.kind not in ('result', 'reward'):
                 increased.clear()
@@ -498,4 +595,7 @@ class RecruitRunner:
         folder.mkdir(exist_ok=True)
         stamp = time.strftime('%Y%m%d_%H%M%S')
         cv2.imencode('.png', image)[1].tofile(str(folder / f'{stamp}.png'))
-        (folder / f'{stamp}.json').write_text(json.dumps({'scene': asdict(scene), 'heroes': [asdict(h) for h in heroes]}, ensure_ascii=False, indent=2), encoding='utf-8')
+        geometry = getattr(self.device, 'geometry', None)
+        details = {'scene': asdict(scene), 'heroes': [asdict(h) for h in heroes],
+                   'capture': asdict(geometry) if geometry is not None else None}
+        (folder / f'{stamp}.json').write_text(json.dumps(details, ensure_ascii=False, indent=2), encoding='utf-8')
