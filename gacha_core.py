@@ -6,6 +6,7 @@ from dataclasses import dataclass, asdict
 import io
 import json
 from pathlib import Path
+import random
 import re
 import subprocess
 import sys
@@ -76,10 +77,11 @@ def read_settings(path=BASE / 'settings.json'):
         data['roles'] = roles
         # An empty selection is intentional: never fall back to all roles.
         data.setdefault('selected_ids', [r['id'] for r in roles])
+        data.setdefault('click_jitter', True)
         return data
     roles = load_roles(ASSETS / 'triple_roles.csv')
     return {'roles': roles, 'selected_ids': [r['id'] for r in roles], 'adb': DEFAULT_ADB,
-            'serial': 'emulator-5554', 'max_rounds': 20, 'coin_limit': 3000}
+            'serial': 'emulator-5554', 'max_rounds': 20, 'coin_limit': 3000, 'click_jitter': True}
 
 
 def save_settings(data, path=BASE / 'settings.json'):
@@ -366,12 +368,15 @@ class Stopped(Exception):
 
 
 class AdbDevice:
-    def __init__(self, adb=DEFAULT_ADB, serial='emulator-5554', stop=None, on_geometry=None):
+    def __init__(self, adb=DEFAULT_ADB, serial='emulator-5554', stop=None, on_geometry=None, click_jitter=True):
         self.adb, self.serial = resolve_adb(adb) or str(adb), serial
         self.stop = stop or threading.Event()
         self.actual_size = None
         self.geometry = None
         self.on_geometry = on_geometry
+        self.click_jitter = bool(click_jitter)
+        self._click_random = random.SystemRandom()
+        self._click_offsets = {}
 
     def command(self, *args, timeout=20):
         if self.stop.is_set():
@@ -399,6 +404,18 @@ class AdbDevice:
         if self.geometry is None:
             raise RuntimeError('请先获取设备截图')
         x, y = self.geometry.to_device_point(point)
+        if self.click_jitter:
+            left, top, width, height = self.geometry.viewport
+            # Small disk around the recognized point: roughly 3 pixels on
+            # a 1080-wide portrait screen, capped at 6 actual device pixels.
+            radius = min(6, max(1, round(min(width, height) / 360)))
+            if radius not in self._click_offsets:
+                self._click_offsets[radius] = tuple((dx, dy)
+                    for dx in range(-radius, radius + 1)
+                    for dy in range(-radius, radius + 1) if dx * dx + dy * dy <= radius * radius)
+            dx, dy = self._click_random.choice(self._click_offsets[radius])
+            x = min(left + width - 1, max(left, x + dx))
+            y = min(top + height - 1, max(top, y + dy))
         self.command('shell', 'input', 'tap', str(x), str(y))
 
     def wait(self, seconds):

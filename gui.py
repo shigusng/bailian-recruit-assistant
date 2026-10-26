@@ -203,21 +203,26 @@ class RecruitApp:
         window = tk.Toplevel(self.root)
         self.settings_window = window
         window.title('百炼英雄 · 设置')
-        window.geometry('780x330')
-        window.minsize(650, 300)
+        window.geometry('780x410')
+        window.minsize(650, 390)
         window.transient(self.root)
         window.backdrop = WindowBackdrop(window, self.background_image)
-        ttk.Label(window, text='连接设置', style='Title.TLabel').pack(anchor='w', padx=18, pady=(16, 12))
+        ttk.Label(window, text='连接与点击设置', style='Title.TLabel').pack(anchor='w', padx=18, pady=(16, 12))
         body = BackdropFrame(window, padding=14, shade=.6)
         body.pack(fill='x', padx=16)
         body.columnconfigure(1, weight=1)
         self.settings_adb_var = tk.StringVar(value=self.adb_var.get())
         self.settings_serial_var = tk.StringVar(value=self.serial_var.get())
+        self.settings_click_jitter_var = tk.BooleanVar(value=bool(self.settings.get('click_jitter', True)))
         ttk.Label(body, text='ADB 路径').grid(row=0, column=0, sticky='w', padx=(0, 10), pady=7)
         ttk.Entry(body, textvariable=self.settings_adb_var).grid(row=0, column=1, sticky='ew', pady=7)
         ttk.Button(body, text='浏览…', command=self.browse_adb).grid(row=0, column=2, padx=(8, 0), pady=7)
         ttk.Label(body, text='设备序列号').grid(row=1, column=0, sticky='w', padx=(0, 10), pady=7)
         ttk.Entry(body, textvariable=self.settings_serial_var).grid(row=1, column=1, sticky='ew', pady=7)
+        ttk.Checkbutton(body, text='点击轻微偏移', variable=self.settings_click_jitter_var).grid(
+            row=2, column=0, columnspan=3, sticky='w', pady=(10, 3))
+        ttk.Label(body, text='在识别落点附近小幅随机偏移，按画面尺寸缩放；关闭后使用原落点。',
+                  wraplength=680, style='Hint.TLabel').grid(row=3, column=0, columnspan=3, sticky='w', pady=(0, 4))
         ttk.Label(window, text='OCR 优先使用可用独显，无可用独显时自动使用 CPU。保存后可点击主面板「环境检测」检查连接和识别环境。',
                   wraplength=720, style='Hint.TLabel').pack(anchor='w', padx=18, pady=12)
         controls = BackdropFrame(window, padding=12, shade=.5)
@@ -241,23 +246,25 @@ class RecruitApp:
             return
         adb = self.settings_adb_var.get().strip().strip('"')
         serial = self.settings_serial_var.get().strip()
+        click_jitter = bool(self.settings_click_jitter_var.get())
         if not adb or not serial:
             self.record_error('连接设置', 'ADB 路径或设备序列号未填写')
             messagebox.showerror('设置无效', '请填写 ADB 路径和设备序列号。', parent=self.settings_window)
             return
         if adb.lower() not in ('adb', 'adb.exe'):
             adb = resolve_adb(adb) or adb
-        previous = self.adb_var.get(), self.serial_var.get()
+        previous = self.adb_var.get(), self.serial_var.get(), self.settings.get('click_jitter', True)
         self.adb_var.set(adb)
         self.serial_var.set(serial)
-        self.settings.update(adb=adb, serial=serial)
+        self.settings.update(adb=adb, serial=serial, click_jitter=click_jitter)
         if not self.persist():
             self.adb_var.set(previous[0])
             self.serial_var.set(previous[1])
-            self.settings.update(adb=previous[0], serial=previous[1])
+            self.settings.update(adb=previous[0], serial=previous[1], click_jitter=previous[2])
             return
-        self.environment_status_var.set('环境：连接设置已更新，请重新检测')
-        self.append_log('连接设置已保存')
+        if (adb, serial) != previous[:2]:
+            self.environment_status_var.set('环境：连接设置已更新，请重新检测')
+        self.append_log('设置已保存；点击轻微偏移：' + ('开启' if click_jitter else '关闭'))
         self.close_settings()
 
     def close_settings(self):
@@ -712,6 +719,7 @@ class RecruitApp:
             messagebox.showerror('参数无效', '请在「设置」中填写 ADB 路径和设备序列号；轮数及金币上限须为非负整数。', parent=self.root)
             return
         self.settings.update(adb=adb, serial=serial, max_rounds=rounds, coin_limit=coins)
+        click_jitter = bool(self.settings.get('click_jitter', True))
         if not self.persist():
             return
         run_id = None
@@ -757,7 +765,10 @@ class RecruitApp:
                         self.record_error('OCR / CPU 回退', self.reader.backend_note, level='WARNING')
                         self.events.put(('log', 'GPU 未启用，已使用 CPU：' + self.reader.backend_note))
                 device = AdbDevice(adb=adb, serial=serial, stop=self.stop_event,
-                                   on_geometry=lambda geometry: self.events.put(('geometry', geometry.describe())))
+                                   on_geometry=lambda geometry: self.events.put(('geometry', geometry.describe())),
+                                   click_jitter=click_jitter)
+                if recruit:
+                    self.events.put(('log', '点击轻微偏移：' + ('开启' if click_jitter else '关闭')))
                 runner = RecruitRunner(device, self.recognizer, self.reader, self.selected,
                                        log=lambda s: self.events.put(('log', s)), update=self.publish_frame,
                                        on_recruited=recruited, on_draw=submitted)

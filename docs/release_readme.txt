@@ -1,4 +1,4 @@
-百练英雄自动抽卡 v1.1.0 · Windows 64 位便携版
+百练英雄自动抽卡 v1.1.1 · Windows 64 位便携版
 
 便携版下载：https://github.com/shigusng/bailian-recruit-assistant/releases/latest
 源码与说明：https://github.com/shigusng/bailian-recruit-assistant
@@ -10,6 +10,8 @@
 2. 启动模拟器，在游戏中手动打开“常驻招募”界面。
    在左上角“设置”中填写设备序列号；ADB 默认填 adb，自动使用内置版本。
    如需使用模拟器自己的 ADB，可在设置中选择其 adb.exe。
+   “点击轻微偏移”默认开启，按画面尺寸在识别落点附近小幅随机偏移，可关闭并保存。
+   此功能只改变落点，不能保证规避游戏的自动化检测。
 
 3. 点击“环境检测”查看设备连接与识别环境。
    检测到可用独显时优先使用 GPU；否则自动使用 CPU。
