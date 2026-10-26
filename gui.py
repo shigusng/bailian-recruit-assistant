@@ -19,6 +19,8 @@ from panel_theme import (BackdropCanvas, BackdropFrame, SURFACE, TEXT,
                          WindowBackdrop, configure_theme)
 from environment_check import check_environment, resolve_adb
 from error_journal import ErrorJournal
+from adb_connection import (ConnectionCancelled, DeviceChoiceRequired, connect_emulator,
+                            discover_emulators)
 
 
 class RecruitApp:
@@ -34,6 +36,11 @@ class RecruitApp:
         self.active_run_id = None
         self.history_window = self.history_tree = self.history_detail_tree = None
         self.settings_window = self.settings_save_button = None
+        self.settings_scan_button = self.settings_connect_button = self.settings_serial_entry = None
+        self.settings_adb_entry = self.settings_browse_button = None
+        self.connection_worker = None
+        self.connection_stop = threading.Event()
+        self.connection_candidates = []
         self.environment_window = self.environment_tree = None
         self.environment_retry_button = self.environment_cancel_button = None
         self.environment_worker = None
@@ -66,6 +73,8 @@ class RecruitApp:
         self.adb_var = tk.StringVar(value=self.settings.get('adb', ''))
         self.serial_var = tk.StringVar(value=self.settings.get('serial', 'emulator-5554'))
         ttk.Button(connection, text='设置', command=self.show_settings).pack(side='left')
+        self.connect_button = ttk.Button(connection, text='一键连接模拟器', command=self.quick_connect)
+        self.connect_button.pack(side='left', padx=(8, 0))
         self.environment_button = ttk.Button(connection, text='环境检测', command=self.show_environment)
         self.environment_button.pack(side='left', padx=(8, 12))
         self.environment_status_var = tk.StringVar(value='环境：尚未检测')
@@ -207,8 +216,8 @@ class RecruitApp:
         window = tk.Toplevel(self.root)
         self.settings_window = window
         window.title('百炼英雄 · 设置')
-        window.geometry('780x410')
-        window.minsize(650, 390)
+        window.geometry('780x520')
+        window.minsize(650, 490)
         window.transient(self.root)
         window.backdrop = WindowBackdrop(window, self.background_image)
         ttk.Label(window, text='连接与点击设置', style='Title.TLabel').pack(anchor='w', padx=18, pady=(16, 12))
@@ -219,14 +228,28 @@ class RecruitApp:
         self.settings_serial_var = tk.StringVar(value=self.serial_var.get())
         self.settings_click_jitter_var = tk.BooleanVar(value=bool(self.settings.get('click_jitter', True)))
         ttk.Label(body, text='ADB 路径').grid(row=0, column=0, sticky='w', padx=(0, 10), pady=7)
-        ttk.Entry(body, textvariable=self.settings_adb_var).grid(row=0, column=1, sticky='ew', pady=7)
-        ttk.Button(body, text='浏览…', command=self.browse_adb).grid(row=0, column=2, padx=(8, 0), pady=7)
+        self.settings_adb_entry = ttk.Entry(body, textvariable=self.settings_adb_var)
+        self.settings_adb_entry.grid(row=0, column=1, sticky='ew', pady=7)
+        self.settings_browse_button = ttk.Button(body, text='浏览…', command=self.browse_adb)
+        self.settings_browse_button.grid(row=0, column=2, padx=(8, 0), pady=7)
         ttk.Label(body, text='设备序列号').grid(row=1, column=0, sticky='w', padx=(0, 10), pady=7)
-        ttk.Entry(body, textvariable=self.settings_serial_var).grid(row=1, column=1, sticky='ew', pady=7)
+        self.settings_serial_entry = ttk.Combobox(body, textvariable=self.settings_serial_var,
+                                                values=[item.description for item in self.connection_candidates])
+        self.settings_serial_entry.grid(row=1, column=1, sticky='ew', pady=7)
+        self.settings_serial_entry.bind('<<ComboboxSelected>>', self.select_scanned_device)
+        actions = BackdropFrame(body, shade=.6)
+        actions.grid(row=2, column=0, columnspan=3, sticky='w', pady=(4, 5))
+        self.settings_scan_button = ttk.Button(actions, text='扫描模拟器', command=lambda: self.start_connection(False))
+        self.settings_scan_button.pack(side='left')
+        self.settings_connect_button = ttk.Button(actions, text='一键连接', command=lambda: self.start_connection(True))
+        self.settings_connect_button.pack(side='left', padx=8)
+        self.settings_connection_status_var = tk.StringVar(value='启动模拟器后点击「一键连接」；多开时先扫描，再从下拉列表选择设备。')
+        ttk.Label(body, textvariable=self.settings_connection_status_var, wraplength=680,
+                  style='Hint.TLabel').grid(row=3, column=0, columnspan=3, sticky='w', pady=(0, 6))
         ttk.Checkbutton(body, text='点击轻微偏移', variable=self.settings_click_jitter_var).grid(
-            row=2, column=0, columnspan=3, sticky='w', pady=(10, 3))
+            row=4, column=0, columnspan=3, sticky='w', pady=(10, 3))
         ttk.Label(body, text='在识别落点附近小幅随机偏移，按画面尺寸缩放；关闭后使用原落点。',
-                  wraplength=680, style='Hint.TLabel').grid(row=3, column=0, columnspan=3, sticky='w', pady=(0, 4))
+                  wraplength=680, style='Hint.TLabel').grid(row=5, column=0, columnspan=3, sticky='w', pady=(0, 4))
         ttk.Label(window, text='OCR 优先使用可用独显，无可用独显时自动使用 CPU。保存后可点击主面板「环境检测」检查连接和识别环境。',
                   wraplength=720, style='Hint.TLabel').pack(anchor='w', padx=18, pady=12)
         controls = BackdropFrame(window, padding=12, shade=.5)
@@ -235,8 +258,7 @@ class RecruitApp:
         ttk.Button(controls, text='关闭', command=self.close_settings).pack(side='right')
         self.settings_save_button = ttk.Button(controls, text='保存设置', command=self.save_connection_settings)
         self.settings_save_button.pack(side='right', padx=8)
-        if self.worker is not None or self.environment_worker is not None:
-            self.settings_save_button.configure(state='disabled')
+        self.set_connection_controls_busy(self.worker is not None or self.environment_worker is not None or self.connection_worker is not None)
         window.protocol('WM_DELETE_WINDOW', self.close_settings)
 
     def browse_adb(self):
@@ -246,7 +268,7 @@ class RecruitApp:
             self.settings_adb_var.set(path)
 
     def save_connection_settings(self):
-        if self.worker is not None or self.environment_worker is not None:
+        if self.worker is not None or self.environment_worker is not None or self.connection_worker is not None:
             return
         adb = self.settings_adb_var.get().strip().strip('"')
         serial = self.settings_serial_var.get().strip()
@@ -275,6 +297,94 @@ class RecruitApp:
         if self.settings_window is not None:
             self.settings_window.destroy()
         self.settings_window = self.settings_save_button = None
+        self.settings_scan_button = self.settings_connect_button = self.settings_serial_entry = None
+        self.settings_adb_entry = self.settings_browse_button = None
+
+    def quick_connect(self):
+        if self.worker is not None or self.environment_worker is not None or self.connection_worker is not None or self.closing:
+            return
+        self.show_settings()
+        self.start_connection(True)
+
+    def start_connection(self, connect):
+        if self.worker is not None or self.environment_worker is not None or self.connection_worker is not None or self.closing:
+            return
+        adb, serial = self.settings_adb_var.get().strip(), self.settings_serial_var.get().strip()
+        self.connection_stop.clear()
+        self.stop_event.clear()
+        self.set_busy(True)
+        self.status_var.set('连接模拟器中' if connect else '扫描模拟器中')
+        self.settings_connection_status_var.set(self.status_var.get() + '……')
+
+        def report(message):
+            self.events.put(('connection_status', message))
+
+        def work():
+            summary = '已停止'
+            status = '已停止'
+            try:
+                if connect:
+                    _, chosen, candidates = connect_emulator(adb, serial, self.connection_stop, report)
+                    self.events.put(('connection_candidates', candidates))
+                    self.events.put(('connected', {'adb': adb, 'serial': chosen}))
+                    summary = '已连接：' + chosen
+                    status = '模拟器已连接'
+                else:
+                    adb_path = resolve_adb(adb)
+                    if adb_path is None:
+                        raise RuntimeError('未找到 ADB，请选择 adb.exe；便携版可填 adb。')
+                    candidates = discover_emulators(adb_path, self.connection_stop, report)
+                    self.events.put(('connection_candidates', candidates))
+                    summary = (f'发现 {len(candidates)} 个设备，请选择后点击「一键连接」。' if candidates else
+                               '未发现模拟器，请先启动模拟器并开启 ADB 调试（本机连接），再扫描。')
+                    status = '扫描完成' if candidates else '未发现模拟器'
+            except DeviceChoiceRequired as error:
+                self.events.put(('connection_candidates', error.candidates))
+                summary = str(error)
+                status = '请选择模拟器'
+            except ConnectionCancelled:
+                pass
+            except Exception as error:
+                summary = str(error)
+                status = '连接失败'
+                self.record_error('模拟器连接', summary, error=error)
+            finally:
+                self.events.put(('connection_done', {'summary': summary, 'status': status}))
+
+        self.connection_worker = threading.Thread(target=work, daemon=True)
+        self.connection_worker.start()
+
+    def show_connection_candidates(self, candidates):
+        self.connection_candidates = candidates
+        if self.settings_serial_entry is None:
+            return
+        serials = [item.serial for item in candidates]
+        self.settings_serial_entry.configure(values=[item.description for item in candidates])
+        if self.settings_serial_var.get() not in serials and len(serials) == 1:
+            self.settings_serial_var.set(serials[0])
+
+    def select_scanned_device(self, event=None):
+        description = self.settings_serial_var.get()
+        device = next((item for item in self.connection_candidates if item.description == description), None)
+        if device is not None:
+            self.settings_serial_var.set(device.serial)
+            self.settings_connection_status_var.set('已选择 ' + device.description + '，点击「一键连接」即可。')
+
+    def save_connected_device(self, connection):
+        previous = self.adb_var.get(), self.serial_var.get()
+        self.adb_var.set(connection['adb'])
+        self.serial_var.set(connection['serial'])
+        self.settings.update(adb=connection['adb'], serial=connection['serial'])
+        if not self.persist():
+            self.adb_var.set(previous[0])
+            self.serial_var.set(previous[1])
+            self.settings.update(adb=previous[0], serial=previous[1])
+            return
+        if self.settings_window is not None:
+            self.settings_adb_var.set(connection['adb'])
+            self.settings_serial_var.set(connection['serial'])
+        self.environment_status_var.set('设备：已连接 ' + connection['serial'])
+        self.append_log('已连接并保存设备：' + connection['serial'])
 
     def record_error(self, source, message, error=None, details='', level='ERROR'):
         self.error_journal.record(source, message, error=error, details=details, level=level)
@@ -446,7 +556,7 @@ class RecruitApp:
             self.environment_retry_button.configure(state='disabled')
 
     def start_environment_check(self):
-        if self.worker is not None or self.environment_worker is not None or self.closing:
+        if self.worker is not None or self.environment_worker is not None or self.connection_worker is not None or self.closing:
             return
         self.environment_rows.clear()
         if self.environment_tree is not None:
@@ -715,7 +825,7 @@ class RecruitApp:
             self.decision_var.set('当前招募界面尚未确认，等待界面就绪。' if scene.kind != 'result' else '检测到待放弃界面；开始抽取后自动点击放弃并继续。')
 
     def start(self, recruit, until_pity=False):
-        if self.worker is not None or self.environment_worker is not None or self.closing:
+        if self.worker is not None or self.environment_worker is not None or self.connection_worker is not None or self.closing:
             return
         try:
             rounds, coins = int(self.rounds_var.get()), int(self.coins_var.get())
@@ -764,6 +874,9 @@ class RecruitApp:
             runner = None
             outcome, reason = 'completed', ''
             try:
+                adb_path, actual_serial, _ = connect_emulator(adb, serial, self.stop_event,
+                    report=lambda message: self.events.put(('log', message)))
+                self.events.put(('connected', {'adb': adb, 'serial': actual_serial}))
                 if self.recognizer is None:
                     self.events.put(('log', '正在加载目标匹配与 OCR，首次检测需要几秒。'))
                     self.recognizer = HeroRecognizer()
@@ -776,7 +889,7 @@ class RecruitApp:
                     if self.reader.backend_note:
                         self.record_error('OCR / CPU 回退', self.reader.backend_note, level='WARNING')
                         self.events.put(('log', 'GPU 未启用，已使用 CPU：' + self.reader.backend_note))
-                device = AdbDevice(adb=adb, serial=serial, stop=self.stop_event,
+                device = AdbDevice(adb=adb_path, serial=actual_serial, stop=self.stop_event,
                                    on_geometry=lambda geometry: self.events.put(('geometry', geometry.describe())),
                                    click_jitter=click_jitter)
                 if recruit:
@@ -790,10 +903,12 @@ class RecruitApp:
                     _, scene, heroes, target = runner.inspect()
                     match_text = '匹配到：' + ' / '.join(h.name for h in heroes) if heroes else '未匹配到勾选角色'
                     self.events.put(('log', '检测完成：' + (match_text + f' → {target} 倍' if scene.kind == 'select' else '当前不是招募选择界面')))
-            except Stopped:
+            except (Stopped, ConnectionCancelled):
                 outcome, reason = 'stopped', '用户停止'
                 self.events.put(('log', '已停止'))
             except Exception as error:
+                if isinstance(error, DeviceChoiceRequired):
+                    self.events.put(('connection_candidates', error.candidates))
                 outcome, reason = 'error', str(error)
                 self.record_error('自动抽取' if recruit else '检测勾选角色', str(error), error=error)
                 self.events.put(('log', f'已停止：{error}'))
@@ -817,14 +932,20 @@ class RecruitApp:
         self.worker.start()
 
     def set_busy(self, busy):
-        for button in (self.detect_button, self.start_button, self.pity_button, self.import_button, self.clear_stats_button, self.environment_button):
+        for button in (self.detect_button, self.start_button, self.pity_button, self.import_button, self.clear_stats_button, self.environment_button, self.connect_button):
             button.configure(state='disabled' if busy else 'normal')
-        if self.settings_save_button is not None:
-            self.settings_save_button.configure(state='disabled' if busy else 'normal')
+        self.set_connection_controls_busy(busy)
         self.stop_button.configure(state='normal' if busy else 'disabled')
+
+    def set_connection_controls_busy(self, busy):
+        for control in (self.settings_save_button, self.settings_scan_button, self.settings_connect_button,
+                        self.settings_serial_entry, self.settings_adb_entry, self.settings_browse_button):
+            if control is not None:
+                control.configure(state='disabled' if busy else 'normal')
 
     def stop(self):
         self.stop_event.set()
+        self.connection_stop.set()
         self.status_var.set('正在停止')
 
     def poll(self):
@@ -859,10 +980,26 @@ class RecruitApp:
                     self.geometry_var.set('画面：' + value)
                 elif kind == 'history':
                     self.refresh_history()
+                elif kind == 'connection_candidates':
+                    self.show_connection_candidates(value)
+                elif kind == 'connected':
+                    self.save_connected_device(value)
+                elif kind == 'connection_status':
+                    if self.settings_window is not None:
+                        self.settings_connection_status_var.set(value)
+                elif kind == 'connection_done':
+                    self.connection_worker = None
+                    self.set_busy(False)
+                    self.status_var.set('已停止' if self.connection_stop.is_set() else value['status'])
+                    self.append_log(value['summary'])
+                    if self.settings_window is not None:
+                        self.settings_connection_status_var.set(value['summary'])
                 elif kind == 'environment_row':
                     self.update_environment_row(value)
                 elif kind == 'environment_done':
                     self.environment_worker = None
+                    if value.get('connection') is not None and not value.get('cancelled'):
+                        self.save_connected_device(value['connection'])
                     if value.get('reader') is not None and not value.get('cancelled'):
                         self.reader = value['reader']
                         self.backend_var.set('OCR：' + self.reader.backend)
@@ -897,7 +1034,8 @@ class RecruitApp:
         self.closing = True
         self.stop_event.set()
         self.environment_stop.set()
-        if any(worker is not None and worker.is_alive() for worker in (self.worker, self.environment_worker)):
+        self.connection_stop.set()
+        if any(worker is not None and worker.is_alive() for worker in (self.worker, self.environment_worker, self.connection_worker)):
             self.status_var.set('正在停止并保存记录')
             self.root.after(100, self.close)
             return

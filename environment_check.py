@@ -11,6 +11,7 @@ import sys
 import tempfile
 
 from runtime_paths import resolve_adb
+from adb_connection import ConnectionCancelled, connect_emulator
 
 
 class CheckCancelled(Exception):
@@ -103,19 +104,14 @@ def check_environment(base, settings_directory, adb, serial, roles, report, stop
             emit('ADB 路径', 'ok', adb_path)
             try:
                 emit('ADB 运行', 'ok', run_adb('version'))
-                devices = run_adb('devices', '-l')
-                states = {parts[0]: parts[1] for line in devices.splitlines()
-                          if len(parts := line.split()) >= 2 and parts[0] != 'List' and not line.startswith('*')}
-                state = states.get(serial)
-                connected = state == 'device'
-                detail = f'{serial}：{state}' if state else f'未找到设备 {serial}'
-                if not connected:
-                    detail += '。请启动模拟器，检查设备序列号及 USB 调试授权。'
-                emit('设备连接', 'ok' if connected else 'error', detail + '\n' + devices)
-            except CheckCancelled:
-                raise
+                _, serial, _ = connect_emulator(adb_path, serial, stop,
+                    report=lambda message: emit('设备连接', 'running', message))
+                connected = True
+                emit('设备连接', 'ok', f'已连接 {serial}；连接参数会自动保存。')
+            except (CheckCancelled, ConnectionCancelled):
+                raise CheckCancelled()
             except Exception as error:
-                emit('ADB 运行', 'error', str(error))
+                emit('设备连接', 'error', str(error))
 
         cancelled()
         emit('OCR 模型与后端', 'running', '正在加载模型并选择独显或 CPU……')
@@ -167,4 +163,5 @@ def check_environment(base, settings_directory, adb, serial, roles, report, stop
         return {'cancelled': True, 'ready': False, 'reader': None, 'rows': list(rows.values())}
 
     return {'cancelled': False, 'ready': not any(row['status'] == 'error' for row in rows.values()),
-            'reader': reader, 'rows': list(rows.values())}
+            'reader': reader, 'rows': list(rows.values()),
+            'connection': {'adb': adb, 'serial': serial} if connected else None}
