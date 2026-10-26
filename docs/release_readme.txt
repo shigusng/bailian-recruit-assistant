@@ -1,4 +1,7 @@
-百炼英雄抽取助手 · Windows 64 位便携版
+百练英雄自动抽卡 v1.0.0 · Windows 64 位便携版
+
+便携版下载：https://github.com/shigusng/bailian-recruit-assistant/releases/latest
+源码与说明：https://github.com/shigusng/bailian-recruit-assistant
 
 1. 将整个压缩包解压到可写目录，再双击“百炼英雄抽取助手.exe”。
    请保留同级的 _internal 文件夹，不要单独移动 EXE 或直接在压缩包内打开。

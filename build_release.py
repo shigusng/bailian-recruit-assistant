@@ -70,7 +70,7 @@ def build():
 
     shutil.copy2(PROJECT / 'docs' / 'release_readme.txt', application / '使用说明.txt')
     shutil.copy2(PROJECT / 'assets' / 'triple_roles.csv', application / '抽取角色名单.csv')
-    archive = release_directory / f'{APP_NAME}_Windows_x64.zip'
+    archive = release_directory / 'BailianHero-AutoGacha-Windows-x64.zip'
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as package:
         for path in sorted(application.rglob('*')):
             if path.is_file():

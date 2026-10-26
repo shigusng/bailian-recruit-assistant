@@ -4,6 +4,15 @@ Windows 桌面抽取面板，通过 ADB 操作模拟器中的「常驻招募」�
 
 角色图片、背景、默认名单和打包脚本均包含在项目中。Windows 便携版还包含 Python、ADB、OCR 模型与 DirectML 运行库，换电脑时完整复制程序目录即可。
 
+## 选择版本
+
+| 版本 | 适合谁 | 下载与说明 |
+| --- | --- | --- |
+| **便携版 · Windows 64 位** | 下载、完整解压后双击使用，无需安装 Python | **[下载便携版 ZIP](https://github.com/shigusng/bailian-recruit-assistant/releases/latest/download/BailianHero-AutoGacha-Windows-x64.zip)** · [便携版使用说明](docs/portable.md) |
+| **源码版** | 希望自行运行、修改代码或重新打包，需要 Python 环境 | **[下载源码 ZIP](https://github.com/shigusng/bailian-recruit-assistant/archive/refs/heads/main.zip)** · [源码版使用说明](docs/source.md) |
+
+直接使用请选择便携版；仓库文件列表提供源码，便携程序在 [Releases 发布页](https://github.com/shigusng/bailian-recruit-assistant/releases/latest) 下载。
+
 ## 功能
 
 - 勾选三倍抽取目标，支持全选、全不选和导入 CSV 名单。
@@ -19,7 +28,7 @@ Windows 桌面抽取面板，通过 ADB 操作模拟器中的「常驻招募」�
 
 ### Windows 便携版
 
-1. 将便携版 ZIP **完整解压**到可写目录。
+1. [下载便携版 ZIP](https://github.com/shigusng/bailian-recruit-assistant/releases/latest/download/BailianHero-AutoGacha-Windows-x64.zip)，**完整解压**到可写目录。
 2. 双击 `百炼英雄抽取助手.exe`，保留同级 `_internal` 文件夹。
 3. 启动模拟器，在游戏中手动打开「常驻招募」。
 4. 点击左上角「设置」，填写设备序列号。默认 ADB 填写 `adb`，会使用内置版本；也可选择模拟器自己的 `adb.exe`。
@@ -150,7 +159,7 @@ ADB 目录需要同时包含 `adb.exe`、`AdbWinApi.dll`、`AdbWinUsbApi.dll` �
 ```text
 dist/北京时间戳/
 ├─ 百炼英雄抽取助手/            # 完整便携程序目录
-└─ 百炼英雄抽取助手_Windows_x64.zip
+└─ BailianHero-AutoGacha-Windows-x64.zip
 ```
 
 每次打包使用新目录，保留已有程序和数据。便携包包含运行资源和 ADB 许可说明，不包含个人设置、历史、日志或本地虚拟环境。构建只检查产物文件齐全，不启动程序、不连接设备；打包成功不等同于已通过游戏运行验证。
@@ -160,6 +169,8 @@ dist/北京时间戳/
 ```text
 assets/                       角色图片、名称表、默认 CSV、背景与结果标记
 docs/release_readme.txt        便携包使用说明
+docs/portable.md               便携版下载与使用入口
+docs/source.md                 源码版下载与使用入口
 tools/legacy_desktop.py        保留的旧版坐标与颜色校准工具
 tests/                        已有测试源码，不参与启动和打包
 auto_gacha.py                 兼容启动入口
